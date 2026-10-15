@@ -1,0 +1,266 @@
+name: Build PS5 Ebook Reader
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['homebrew/ebook-reader/**', '.github/workflows/build-ebook-reader.yml']
+  push:
+    branches: [main]
+    paths: ['homebrew/ebook-reader/**', '.github/workflows/build-ebook-reader.yml']
+permissions:
+  contents: write
+jobs:
+  ps5:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 ninja-build make wget curl unzip tar git python3 python3-pil pkg-config ca-certificates zlib1g-dev libarchive-dev
+      - name: Test USB EPUB discovery on host
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Ihomebrew/ebook-reader/native homebrew/ebook-reader/native/ebook_engine.cpp homebrew/ebook-reader/tests/usb_scan_test.cpp -lz -o /tmp/ebook-usb-scan-test
+          /tmp/ebook-usb-scan-test
+      - name: Test data folder, local Books and persistent diagnostics
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -pthread \
+            -D'EBOOK_DATA_ROOT="/tmp/ebook-reader-log-ci"' \
+            -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/native/ebook_engine.cpp \
+            homebrew/ebook-reader/tests/data_log_test.cpp \
+            -lz -o /tmp/ebook-data-log-test
+          /tmp/ebook-data-log-test
+          python3 - <<'PY'
+          from pathlib import Path
+          code=Path('homebrew/ebook-reader/native/main.cpp').read_text()
+          bridge=Path('homebrew/ebook-reader/native/usb_bridge.cpp').read_text()
+          assert 'statvfs(' not in bridge, 'do not call unverified PS5 statvfs API'
+          start=code.split('bool start_cover(',1)[1].split('void panel(',1)[0]
+          assert 'g_coverBusy.exchange(true)' in start
+          assert 'usbbooks::is_remote(b.path) && (b.format=="CBR"' not in start
+          assert 'ebook_log::books_directory()' in code
+          print('PS5 crash regression guards passed')
+          PY
+      - name: Test real EPUB package/container formats
+        run: |
+          python3 homebrew/ebook-reader/tests/generate_epub_fixtures.py /tmp/ebook-epub-fixtures
+          g++ -std=c++20 -O2 -Wall -Wextra -Ihomebrew/ebook-reader/native homebrew/ebook-reader/native/ebook_engine.cpp homebrew/ebook-reader/tests/epub_package_test.cpp -lz -o /tmp/ebook-package-test
+          /tmp/ebook-package-test /tmp/ebook-epub-fixtures
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ihomebrew/ebook-reader/native -c homebrew/ebook-reader/native/usb_bridge.cpp -o /tmp/ebook-usb-bridge.o
+      - name: Test persistent comic thumbnails and background loading guards
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
+            -D'EBOOK_DATA_ROOT="/tmp/ebook-covers-ci"' \
+            -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/tests/cover_store_test.cpp \
+            -o /tmp/ebook-cover-store-test
+          /tmp/ebook-cover-store-test
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('homebrew/ebook-reader/native/main.cpp').read_text()
+          assert 'g_openDone.store(done)' in src
+          assert 'g_openTotal.store(total)' in src
+          assert 'bool start_book_open(' in src
+          assert 'book_open_worker' in src
+          assert 'ebook_cover::save(task->bookPath,bytes)' in src
+          assert 'usbbooks::is_remote(b.path) && (b.format=="CBR"' not in src
+          # Book opening from Cross must be asynchronous, not a blocking USB
+          # fetch or archive decode inside the frame loop.
+          block=src.split('if((pressed&hui::pad_bits::kCross)&&!visible.empty())',1)[1].split('if(pressed&hui::pad_bits::kL3)',1)[0]
+          assert 'start_book_open(b,message)' in block
+          assert 'usbbooks::fetch(' not in block and 'comic::open(' not in block
+          print('Nonblocking book loading and comic cover flow checks passed')
+          PY
+      - name: Test DualSense main-menu exit confirmation
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/tests/exit_dialog_test.cpp \
+            -o /tmp/ebook-exit-confirm-test
+          /tmp/ebook-exit-confirm-test
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('homebrew/ebook-reader/native/main.cpp').read_text()
+          assert 'ebook_exit::Dialog exitDialog' in src
+          assert 'exitDialog.show()' in src
+          assert 'exitDialog.handle(' in src
+          assert 'EXIT EBOOK READER?' in src
+          assert 'X   YES' in src and 'O   NO' in src
+          assert 'exitPending && !g_coverBusy.load()' in src
+          assert 'if(exitPending){pressed=0;now=0;}' in src
+          assert 'else if(importer)importer=false' in src
+          assert 'else if(reader)' in src
+          print('Modal dialog, worker-safe exit, and existing Back behavior verified')
+          PY
+      - name: Test bookshelf grid, cover crop and top-aligned zoom
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/tests/layout_zoom_test.cpp -o /tmp/ebook-layout-test
+          /tmp/ebook-layout-test
+      - name: Test full-width single-page text layout
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/tests/fullwidth_reflow_test.cpp -o /tmp/ebook-reflow-test
+          /tmp/ebook-reflow-test
+      - name: Test CBR RAR5 and CBZ comic decoding
+        run: |
+          python3 homebrew/ebook-reader/tests/generate_comic_fixtures.py /tmp/comic-fixtures
+          # Known libarchive test RAR5 fixture, pinned to an upstream commit.
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/libarchive/libarchive/76d41c18cf53c888afb2c9477fd595a5d3984192/libarchive/test/test_read_format_rar5_compressed.rar.uu \
+            -o /tmp/comic-fixtures/rar5.uu
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/libarchive/libarchive/76d41c18cf53c888afb2c9477fd595a5d3984192/libarchive/test/test_read_format_rar.rar.uu \
+            -o /tmp/comic-fixtures/rar4.uu
+          python3 - <<'PY'
+          import binascii,pathlib
+          for version in ('rar4','rar5'):
+              lines=pathlib.Path(f'/tmp/comic-fixtures/{version}.uu').read_bytes().splitlines()
+              assert lines[0].startswith(b'begin ')
+              payload=b''.join(binascii.a2b_uu(line) for line in lines[1:]
+                               if line not in (b'end',b'',b'\x60'))
+              assert payload.startswith(b'Rar!\x1a\x07')
+              pathlib.Path(f'/tmp/comic-fixtures/{version}.cbr').write_bytes(payload)
+          PY
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/native/comic_archive.cpp \
+            homebrew/ebook-reader/tests/comic_archive_test.cpp \
+            -larchive -o /tmp/ebook-comic-test
+          /tmp/ebook-comic-test /tmp/comic-fixtures /tmp/comic-fixtures/rar5.cbr /tmp/comic-fixtures/rar4.cbr
+      - name: Test remote ELF USB scanner on host
+        run: |
+          mkdir -p /tmp/ebook-usb-test/Books/Author
+          printf 'BOOK' > /tmp/ebook-usb-test/Books/Author/example.EPUB
+          printf 'Rar!fake' > /tmp/ebook-usb-test/Books/Author/example.CBR
+          gcc -std=gnu11 -Wall -Wextra -Werror -DEBOOK_USB_TEST -D'EBOOK_USB_ROOT="/tmp/ebook-usb-test/Books"' homebrew/ebook-reader/helper/bookscan.c -o /tmp/ebook-scan-host
+          /tmp/ebook-scan-host > /tmp/ebook-scan-output
+          python3 - <<'PY'
+          from pathlib import Path
+          data=Path('/tmp/ebook-scan-output').read_bytes()
+          assert data.startswith(b'EBOOK1\\n') or data.startswith(b'EBOOK1\n')
+          assert b'Author/example.EPUB' in data
+          assert b'Author/example.CBR' in data
+          assert data.endswith(b'DONE\n')
+          print('Read-only USB helper catalog test passed')
+          PY
+      - name: Test safe cache eviction and preservation of local books
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/tests/cache_cleanup_test.cpp \
+            -o /tmp/ebook-cache-test
+          /tmp/ebook-cache-test
+      - name: Test large USB comic transfer and recovery
+        run: |
+          python3 homebrew/ebook-reader/tests/generate_usb_transfer_fixture.py /tmp/ebook-usb-stream
+          gcc -std=gnu11 -O2 -Wall -Wextra -Werror \
+            -D'EBOOK_USB_ROOT="/tmp/ebook-usb-stream/Books"' \
+            -DPORT=19175 -DEBOOK_USB_TEST_DROP_ONCE \
+            homebrew/ebook-reader/helper/bookscan.c -o /tmp/ebook-usb-server-test
+          /tmp/ebook-usb-server-test > /tmp/ebook-usb-server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          python3 - <<'PY'
+          import socket,time
+          for i in range(60):
+              try:
+                  with socket.create_connection(('127.0.0.1',19175),0.2):
+                      break
+              except (ConnectionRefusedError,TimeoutError,OSError):
+                  time.sleep(0.1)
+          else:
+              raise AssertionError("USB helper test server did not start")
+          PY
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
+            -DEBOOK_USB_BRIDGE_PORT=19175 \
+            -D'EBOOK_DATA_ROOT="/tmp/ebook-usb-stream/EbookReader"' \
+            -Ihomebrew/ebook-reader/native \
+            homebrew/ebook-reader/native/usb_bridge.cpp \
+            homebrew/ebook-reader/tests/usb_transfer_test.cpp \
+            -o /tmp/ebook-usb-transfer-test
+          /tmp/ebook-usb-transfer-test /tmp/ebook-usb-stream
+          cat /tmp/ebook-usb-server.log
+      - name: Prepare PS5 scaffold
+        run: |
+          git clone --depth=1 https://github.com/Yahballon/PS5-DevBridge.git /tmp/devbridge
+          cp -a /tmp/devbridge/templates/simple-calc ./app
+          cp homebrew/ebook-reader/native/*.cpp homebrew/ebook-reader/native/*.hpp app/src/
+          # Same fixed, tested image decoder revision used by Payload LauncherX.
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h \
+            -o app/src/stb_image.h
+          test -s app/src/stb_image.h
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          p=Path('app/sce_sys/param.json')
+          d=json.loads(p.read_text())
+          d.update(titleId='PPSA99741',conceptId='99741',contentId='UP9000-PPSA99741_00-PS5EBOOKREADER01',contentVersion='01.000.016')
+          d['localizedParameters']['en-US']['titleName']='Ebook Reader'
+          p.write_text(json.dumps(d,indent=2)+'\n')
+          PY
+          python3 homebrew/ebook-reader/assets/generate_icon.py app/sce_sys/icon0.png
+          cp app/sce_sys/icon0.png app/assets/icon0.png
+          mkdir -p app/assets/Books
+          cp homebrew/ebook-reader/assets/Books/README.txt app/assets/Books/README.txt
+      - name: Prepare OpenGL SDK
+        working-directory: app
+        env:
+          PS5_CLANG: clang-18
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+        run: bash tools/prepare-opengl.sh
+      - name: Prepare POSIX archive
+        run: |
+          mkdir -p app/build/jb-json
+          cp app/.deps/native/ps5-payload-sdk/target/lib/libc.a app/build/jb-json/libjb-posix.a
+          llvm-objcopy-18 --redefine-sym=openlog=jb_sdk_openlog --redefine-sym=closelog=jb_sdk_closelog --redefine-sym=mkstemp=jb_sdk_mkstemp --redefine-sym=mkstemps=jb_sdk_mkstemps --redefine-sym=getpwuid_r=jb_sdk_getpwuid_r app/build/jb-json/libjb-posix.a
+      - name: Build read-only USB helper
+        run: |
+          make -C homebrew/ebook-reader/helper PS5_PAYLOAD_SDK="$GITHUB_WORKSPACE/app/.deps/native/ps5-payload-sdk"
+          cp homebrew/ebook-reader/helper/bookscan.elf app/bookscan.elf
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("app/bookscan.elf")
+          assert p.is_file() and p.stat().st_size>1024
+          assert p.read_bytes()[:6]==b'\x7fELF\x02\x01'
+          PY
+      - name: Build app
+        working-directory: app
+        env:
+          PS5_CLANG: clang-18
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+        run: |
+          # zlib is linked through the tested PacBrew pkg-config resolver.
+          make USE_CCACHE=0 BUILD_JOBS=4 PACBREW_PACKAGES='zlib libarchive' APP_ROOT_FILES=bookscan.elf app
+      - name: Validate installer
+        run: |
+          python3 - <<'PY'
+          import json,zipfile,struct,pathlib
+          p=pathlib.Path('app/dist/PPSA99741')
+          e=(p/'eboot.bin').read_bytes()
+          assert len(e)>1000 and struct.unpack('<I',e[:4])[0]==0x1d3d154f
+          assert b'v0.2.6' in e
+          j=json.loads((p/'sce_sys/param.json').read_text())
+          assert j['titleId']=='PPSA99741' and j['contentVersion']=='01.000.016'
+          for f in ['sce_sys/icon0.png','sce_module/libc.prx','assets/fonts/inter-semibold.huifont','assets/Books/README.txt','bookscan.elf']:
+            assert (p/f).is_file(),f
+          with zipfile.ZipFile('app/dist/PPSA99741.zip') as z:
+            assert z.testzip() is None
+            assert 'PPSA99741/eboot.bin' in z.namelist()
+            assert 'PPSA99741/bookscan.elf' in z.namelist()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ebook-Reader-v0.2.6
+          path: app/dist/PPSA99741.zip
+          if-no-files-found: error
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view ebook-reader-v0.2.6 >/dev/null 2>&1; then exit 0; fi
+          gh release create ebook-reader-v0.2.6 app/dist/PPSA99741.zip --target "$GITHUB_SHA" --title "Ebook Reader v0.2.6" --notes-file homebrew/ebook-reader/RELEASE_NOTES.md
