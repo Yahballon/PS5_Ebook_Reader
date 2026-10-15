@@ -11,7 +11,7 @@
 
 [**⬇️ Download latest PS5 ZIP**](https://github.com/Yahballon/PS5_Ebook_Reader/releases/download/ebook-reader-v0.2.6/PPSA99741.zip) · [**Releases**](https://github.com/Yahballon/PS5_Ebook_Reader/releases) · [**Report an issue**](https://github.com/Yahballon/PS5_Ebook_Reader/issues)
 
-<img src="assets/ebook-reader-preview.webp" width="1000" alt="PS5 Ebook Reader home screen showing a wooden bookshelf with cover thumbnails and genre tabs">
+<img src="screenshots/1.png" width="1000" alt="PS5 Ebook Reader home screen showing a wooden bookshelf with cover thumbnails and genre tabs">
 
 *The Ebook Reader bookshelf on PS5 (v0.2.6). Screenshot supplied by the developer.*
 
