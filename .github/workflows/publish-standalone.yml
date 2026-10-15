@@ -1,0 +1,79 @@
+name: Publish standalone PS5 Ebook Reader v0.2.6
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-standalone.yml'
+      - 'README.md'
+      - 'assets/**'
+permissions:
+  contents: write
+concurrency:
+  group: standalone-ebook-reader-v0.2.6
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Import the exact verified v0.2.6 source tree
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch ebook-reader-v0.2.6 \
+            https://github.com/Yahballon/tmp_lap.git "$RUNNER_TEMP/source"
+          test "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+            "$RUNNER_TEMP/source/homebrew/ebook-reader/app.json")" = "0.2.6"
+          mkdir -p homebrew/ebook-reader
+          cp -a "$RUNNER_TEMP/source/homebrew/ebook-reader/." homebrew/ebook-reader/
+          # The independent source lives here; preserve root README and preview.
+          git add homebrew/ebook-reader
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Import verified native Ebook Reader v0.2.6 source and tests"
+            git push origin HEAD:main
+          fi
+      - name: Download and authenticate the real PS5 installation ZIP
+        run: |
+          set -euo pipefail
+          curl -fL --retry 4 --retry-delay 3 \
+            "https://github.com/Yahballon/tmp_lap/releases/download/ebook-reader-v0.2.6/PPSA99741.zip" \
+            -o "$RUNNER_TEMP/PPSA99741.zip"
+          echo "25c6158761490fcb632379a1dd1808a9e0b3b9df5a680c4384af9e3010446aba  $RUNNER_TEMP/PPSA99741.zip" | sha256sum --check
+          python3 - <<'PY'
+          import io,zipfile,json,struct,os
+          p=os.path.join(os.environ['RUNNER_TEMP'],'PPSA99741.zip')
+          with zipfile.ZipFile(p) as z:
+              assert z.testzip() is None
+              entries=z.namelist()
+              required=['PPSA99741/eboot.bin','PPSA99741/bookscan.elf',
+                        'PPSA99741/sce_sys/icon0.png',
+                        'PPSA99741/sce_module/libc.prx',
+                        'PPSA99741/sce_sys/param.json']
+              assert all(f in entries for f in required), required
+              elf=z.read('PPSA99741/eboot.bin')
+              assert len(elf)>1000 and struct.unpack('<I',elf[:4])[0]==0x1d3d154f
+              assert b'v0.2.6' in elf
+              params=json.loads(z.read('PPSA99741/sce_sys/param.json'))
+              assert params['titleId']=='PPSA99741'
+              assert params['contentVersion']=='01.000.016'
+          print('Verified exact upstream binary, PS5 metadata and complete install ZIP.')
+          PY
+      - name: Publish official standalone GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view ebook-reader-v0.2.6 >/dev/null 2>&1; then
+            echo "Release already exists. Never overwrite the published tag."
+            exit 0
+          fi
+          gh release create ebook-reader-v0.2.6 \
+            "$RUNNER_TEMP/PPSA99741.zip" \
+            --target main \
+            --title "PS5 Ebook Reader v0.2.6" \
+            --notes-file homebrew/ebook-reader/RELEASE_NOTES.md
+          gh release view ebook-reader-v0.2.6 --json tagName,assets
